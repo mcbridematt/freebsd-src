@@ -311,7 +311,7 @@ dev/dpaa2/dpaa2_io.c				optional SOC_NXP_LS
 dev/dpaa2/dpaa2_swp.c				optional SOC_NXP_LS
 dev/dpaa2/dpaa2_bp.c				optional SOC_NXP_LS
 dev/dpaa2/dpaa2_mc_acpi.c			optional SOC_NXP_LS acpi
-#dev/dpaa2/dpaa2_mc_fdt.c			optional SOC_NXP_LS fdt
+dev/dpaa2/dpaa2_mc_fdt.c			optional SOC_NXP_LS fdt
 
 ##
 ## SoC Support
@@ -521,7 +521,7 @@ tegra210_xusb.fw				optional tegra210_xusb_fw	\
 
 # NXP
 arm/freescale/vybrid/vf_i2c.c			optional vf_i2c iicbus SOC_NXP_LS
-arm64/qoriq/qoriq_dw_pci.c			optional pci fdt SOC_NXP_LS
+#arm64/qoriq/qoriq_dw_pci.c			optional pci fdt SOC_NXP_LS
 arm64/qoriq/qoriq_therm.c			optional pci fdt SOC_NXP_LS
 arm64/qoriq/qoriq_therm_if.m			optional pci fdt SOC_NXP_LS
 arm64/qoriq/clk/ls1028a_clkgen.c		optional clk SOC_NXP_LS

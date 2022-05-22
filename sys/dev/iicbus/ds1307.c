@@ -1,5 +1,6 @@
 /*-
  * Copyright (c) 2015 Luiz Otavio O Souza <loos@FreeBSD.org>
+ * Copyright (c) 2022 Mathew McBride <matt@traverse.com.au>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -54,23 +55,34 @@ __FBSDID("$FreeBSD$");
 #include "clock_if.h"
 #include "iicbus_if.h"
 
+enum {
+	TYPE_NONE,
+	TYPE_DS1307,
+	TYPE_MAXIM1307,
+	TYPE_MICROCHIP_MCP7491X,
+	TYPE_EPSON_RX8025,
+	TYPE_EPSON_RX8035,
+	TYPE_COUNT
+};
+
 struct ds1307_softc {
-	device_t	sc_dev;
-	struct intr_config_hook
-			enum_hook;
-	uint8_t		sc_ctrl;
-	bool		sc_mcp7941x;
-	bool		sc_use_ampm;
+	device_t			sc_dev;
+	struct intr_config_hook		enum_hook;
+	uint32_t			chiptype;
+	uint8_t				sc_ctrl;
+	bool				sc_use_ampm;
 };
 
 static void ds1307_start(void *);
 
 #ifdef FDT
 static const struct ofw_compat_data ds1307_compat_data[] = {
-    {"dallas,ds1307",		(uintptr_t)"Dallas DS1307 RTC"},
-    {"maxim,ds1307",		(uintptr_t)"Maxim DS1307 RTC"},
-    {"microchip,mcp7941x",	(uintptr_t)"Microchip MCP7941x RTC"},
-    { NULL, 0 }
+	{"dallas,ds1307",		TYPE_DS1307},
+	{"maxim,ds1307",		TYPE_MAXIM1307},
+	{"microchip,mcp7941x",		TYPE_MICROCHIP_MCP7491X},
+	{"epson,rx8025",		TYPE_EPSON_RX8025},
+	{"epson,rx8035",		TYPE_EPSON_RX8035},
+	{ NULL, 0 }
 };
 #endif
 
@@ -96,7 +108,8 @@ ds1307_ctrl_read(struct ds1307_softc *sc)
 	sc->sc_ctrl = 0;
 	error = ds1307_read1(sc->sc_dev, DS1307_CONTROL, &sc->sc_ctrl);
 	if (error) {
-		device_printf(sc->sc_dev, "cannot read from RTC.\n");
+		device_printf(sc->sc_dev, "%s: cannot read from RTC: %d\n",
+		    __func__, error);
 		return (error);
 	}
 
@@ -112,7 +125,8 @@ ds1307_ctrl_write(struct ds1307_softc *sc)
 	ctrl = sc->sc_ctrl & DS1307_CTRL_MASK;
 	error = ds1307_write1(sc->sc_dev, DS1307_CONTROL, ctrl);
 	if (error != 0)
-		device_printf(sc->sc_dev, "cannot write to RTC.\n");
+		device_printf(sc->sc_dev, "%s: cannot write to RTC: %d\n",
+		    __func__, error);
 
 	return (error);
 }
@@ -127,7 +141,7 @@ ds1307_sqwe_sysctl(SYSCTL_HANDLER_ARGS)
 	error = ds1307_ctrl_read(sc);
 	if (error != 0)
 		return (error);
-	if (sc->sc_mcp7941x)
+	if (sc->chiptype == TYPE_DS1307)
 		sqwe_bit = MCP7941X_CTRL_SQWE;
 	else
 		sqwe_bit = DS1307_CTRL_SQWE;
@@ -216,11 +230,32 @@ ds1307_probe(device_t dev)
 		return (ENXIO);
 
 	compat = ofw_bus_search_compatible(dev, ds1307_compat_data);
-	if (compat->ocd_str != NULL) {
-		device_set_desc(dev, (const char *)compat->ocd_data);
-		return (BUS_PROBE_DEFAULT);
+	if (compat->ocd_str == NULL)
+		return (ENXIO);
+
+	switch(compat->ocd_data) {
+		case TYPE_DS1307:
+			device_set_desc(dev, "Dallas DS1307");
+			break;
+		case TYPE_MAXIM1307:
+			device_set_desc(dev, "Maxim DS1307");
+			break;
+		case TYPE_MICROCHIP_MCP7491X:
+			device_set_desc(dev, "Microchip MCP7491X");
+			break;
+		case TYPE_EPSON_RX8025:
+			device_set_desc(dev, "Epson RX-8025");
+			break;
+		case TYPE_EPSON_RX8035:
+			device_set_desc(dev, "Epson RX-8035");
+			break;
+		default:
+			device_set_desc(dev, "Unknown DS1307-like device");
+			break;
 	}
+	return (BUS_PROBE_DEFAULT);
 #endif
+
 	device_set_desc(dev, "Maxim DS1307 RTC");
 	return (BUS_PROBE_NOWILDCARD);
 }
@@ -228,16 +263,23 @@ ds1307_probe(device_t dev)
 static int
 ds1307_attach(device_t dev)
 {
+#ifdef FDT
+	const struct ofw_compat_data *compat;
+#endif
 	struct ds1307_softc *sc;
 
 	sc = device_get_softc(dev);
 	sc->sc_dev = dev;
 	sc->enum_hook.ich_func = ds1307_start;
 	sc->enum_hook.ich_arg = dev;
-
 #ifdef FDT
-	if (ofw_bus_is_compatible(dev, "microchip,mcp7941x"))
-		sc->sc_mcp7941x = 1;
+	compat = ofw_bus_search_compatible(dev, ds1307_compat_data);
+	sc->chiptype = compat->ocd_data;
+	/* Unify the chiptypes to DS1307 where possible. */
+	if (sc->chiptype == TYPE_MAXIM1307)
+		sc->chiptype = TYPE_DS1307;
+#else
+	sc->chiptype = TYPE_DS1307;
 #endif
 
 	/*
@@ -258,6 +300,82 @@ ds1307_detach(device_t dev)
 	return (0);
 }
 
+static bool
+is_epson_time_valid(struct ds1307_softc *sc)
+{
+	device_t dev;
+	int error;
+	uint8_t ctrl2;
+	bool xstp;
+
+	dev = sc->sc_dev;
+	/* 
+	 * The RX8025/RX8035 single register read is non-standard
+	 * Refer to section 8.9.5 of the RX-8035 application manual:
+	 * "I2C bus basic transfer format", under "Standard Read Method".
+	 * Basically, register to read goes into the top 4 bits.
+	 */
+	error = ds1307_read1(dev, (RX80X5_CTRL_2 << 4), &ctrl2);
+	if (error) {
+		device_printf(dev, "%s cannot read Control 2 register: %d\n",
+		    __func__, error);
+		return false;
+	}
+	xstp = (ctrl2 & RX80X5_CTRL_2_XSTP);
+	/*
+	 * XSTP is inverted on RX-8025:
+	 * (xstp == 1 -> OSC stop on RX-8035,
+	 *  xstp == 0 -> OSC stop on RX-8025)
+	 */
+	if (sc->chiptype == TYPE_EPSON_RX8025)
+		xstp = !xstp;
+
+	if (xstp) {
+		device_printf(dev, "Oscillation stop detected (ctrl2=%#02x)\n",
+		    ctrl2);
+		return false;
+	}
+
+	return true;
+}
+
+static bool is_dev_time_valid(struct ds1307_softc *sc)
+{
+	device_t dev;
+	int error;
+	uint8_t osc_en;
+	uint8_t secs;
+
+	/* Epsons are special. */
+	switch (sc->chiptype) {
+	case TYPE_EPSON_RX8025:
+	case TYPE_EPSON_RX8035:
+		return is_epson_time_valid(sc);
+	}
+
+	dev = sc->sc_dev;
+	/* Check if the oscillator is disabled. */
+	error = ds1307_read1(dev, DS1307_SECS, &secs);
+	if (error) {
+		device_printf(dev, "%s: cannot read from RTC: %d\n",
+		    __func__, error);
+		return false;
+	}
+
+	switch (sc->chiptype) {
+	case TYPE_MICROCHIP_MCP7491X:
+		osc_en = 0x80;
+		break;
+	default:
+		osc_en = 0x00;
+		break;
+	}
+	if (((secs & DS1307_SECS_CH) ^ osc_en) != 0)
+		return false;
+
+	return true;
+}
+
 static void
 ds1307_start(void *xdev)
 {
@@ -266,33 +384,29 @@ ds1307_start(void *xdev)
 	struct sysctl_ctx_list *ctx;
 	struct sysctl_oid *tree_node;
 	struct sysctl_oid_list *tree;
-	uint8_t secs;
-	uint8_t osc_en;
 
 	dev = (device_t)xdev;
 	sc = device_get_softc(dev);
+
+	config_intrhook_disestablish(&sc->enum_hook);
+
+	if (!is_dev_time_valid(sc))
+		device_printf(dev,
+		    "WARNING: RTC clock stopped, check the battery.\n");
+
+	/*
+	 * Configuration parameters:
+	 * square wave output cannot be changed or inhibited on the RX-8035,
+	 * so don't present the sysctls there.
+	 * XXX-BZ 8025?
+	 */
+	if (sc->chiptype == TYPE_EPSON_RX8035)
+		goto skip_sysctl;
+
 	ctx = device_get_sysctl_ctx(dev);
 	tree_node = device_get_sysctl_tree(dev);
 	tree = SYSCTL_CHILDREN(tree_node);
 
-	config_intrhook_disestablish(&sc->enum_hook);
-
-	/* Check if the oscillator is disabled. */
-	if (ds1307_read1(sc->sc_dev, DS1307_SECS, &secs) != 0) {
-		device_printf(sc->sc_dev, "cannot read from RTC.\n");
-		return;
-	}
-	if (sc->sc_mcp7941x)
-		osc_en = 0x80;
-	else
-		osc_en = 0x00;
-
-	if (((secs & DS1307_SECS_CH) ^ osc_en) != 0) {
-		device_printf(sc->sc_dev,
-		    "WARNING: RTC clock stopped, check the battery.\n");
-	}
-
-	/* Configuration parameters. */
 	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "sqwe",
 	    CTLFLAG_RW | CTLTYPE_UINT | CTLFLAG_MPSAFE, sc, 0,
 	    ds1307_sqwe_sysctl, "IU", "DS1307 square-wave enable");
@@ -302,13 +416,16 @@ ds1307_start(void *xdev)
 	    "DS1307 square-wave output frequency");
 	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "sqw_out",
 	    CTLFLAG_RW | CTLTYPE_UINT | CTLFLAG_MPSAFE, sc, 0,
-	    ds1307_sqw_out_sysctl, "IU", "DS1307 square-wave output state");
+	    ds1307_sqw_out_sysctl, "IU",
+	    "DS1307 square-wave output state");
+skip_sysctl:
 
 	/*
 	 * Register as a clock with 1 second resolution.  Schedule the
 	 * clock_settime() method to be called just after top-of-second;
 	 * resetting the time resets top-of-second in the hardware.
 	 */
+
 	clock_register_flags(dev, 1000000, CLOCKF_SETTIME_NO_ADJ);
 	clock_schedule(dev, 1);
 }
@@ -316,27 +433,24 @@ ds1307_start(void *xdev)
 static int
 ds1307_gettime(device_t dev, struct timespec *ts)
 {
-	int error;
 	struct bcd_clocktime bct;
 	struct ds1307_softc *sc;
-	uint8_t data[7], hourmask, st_mask;
+	int error;
+	uint8_t data[7], hourmask;
 
 	sc = device_get_softc(dev);
 	error = iicdev_readfrom(sc->sc_dev, DS1307_SECS, data, sizeof(data),
 	    IIC_INTRWAIT);
 	if (error != 0) {
-		device_printf(dev, "cannot read from RTC.\n");
+		device_printf(dev, "%s: cannot read from RTC: %d\n",
+		    __func__, error);
 		return (error);
 	}
 
-	/* If the clock halted, we don't have good data. */
-	if (sc->sc_mcp7941x)
-		st_mask = 0x80;
-	else
-		st_mask = 0x00;
-
-	if (((data[DS1307_SECS] & DS1307_SECS_CH) ^ st_mask) != 0)
+	if (!is_dev_time_valid(sc)) {
+		device_printf(dev, "Device time not valid.\n");
 		return (EINVAL);
+	}
 
 	/* If chip is in AM/PM mode remember that. */
 	if (data[DS1307_HOUR] & DS1307_HOUR_USE_AMPM) {
@@ -392,18 +506,20 @@ ds1307_settime(device_t dev, struct timespec *ts)
 	data[DS1307_WEEKDAY] = bct.dow;
 	data[DS1307_MONTH]   = bct.mon;
 	data[DS1307_YEAR]    = bct.year & 0xff;
-	if (sc->sc_mcp7941x) {
+	if (sc->chiptype == TYPE_MICROCHIP_MCP7491X) {
 		data[DS1307_SECS] |= MCP7941X_SECS_ST;
 		data[DS1307_WEEKDAY] |= MCP7941X_WEEKDAY_VBATEN;
 		year = bcd2bin(bct.year >> 8) * 100 + bcd2bin(bct.year & 0xff);
 		if ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)
 			data[DS1307_MONTH] |= MCP7941X_MONTH_LPYR;
 	}
+
 	/* Write the time back to RTC. */
 	error = iicdev_writeto(sc->sc_dev, DS1307_SECS, data, sizeof(data),
 	    IIC_INTRWAIT);
 	if (error != 0)
-		device_printf(dev, "cannot write to RTC.\n");
+		device_printf(dev, "%s: cannot write to RTC: %d\n",
+		    __func__, error);
 
 	return (error);
 }

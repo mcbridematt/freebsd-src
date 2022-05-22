@@ -63,4 +63,7 @@
 #define	DS1307_CTRL_RS_MASK		(DS1307_CTRL_RS1 | DS1307_CTRL_RS0)
 #define	DS1307_CTRL_MASK		0x93
 
+#define	RX80X5_CTRL_2			0x0F
+#define	RX80X5_CTRL_2_XSTP		(1 << 5)
+
 #endif	/* _DS1307REG_H_ */

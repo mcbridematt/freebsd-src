@@ -60,7 +60,6 @@ enum {
 	TYPE_DS1307,
 	TYPE_MAXIM1307,
 	TYPE_MICROCHIP_MCP7491X,
-	TYPE_EPSON_RX8025,
 	TYPE_EPSON_RX8035,
 	TYPE_COUNT
 };
@@ -80,7 +79,6 @@ static const struct ofw_compat_data ds1307_compat_data[] = {
 	{"dallas,ds1307",		TYPE_DS1307},
 	{"maxim,ds1307",		TYPE_MAXIM1307},
 	{"microchip,mcp7941x",		TYPE_MICROCHIP_MCP7491X},
-	{"epson,rx8025",		TYPE_EPSON_RX8025},
 	{"epson,rx8035",		TYPE_EPSON_RX8035},
 	{ NULL, 0 }
 };
@@ -243,9 +241,6 @@ ds1307_probe(device_t dev)
 		case TYPE_MICROCHIP_MCP7491X:
 			device_set_desc(dev, "Microchip MCP7491X");
 			break;
-		case TYPE_EPSON_RX8025:
-			device_set_desc(dev, "Epson RX-8025");
-			break;
 		case TYPE_EPSON_RX8035:
 			device_set_desc(dev, "Epson RX-8035");
 			break;
@@ -306,32 +301,31 @@ is_epson_time_valid(struct ds1307_softc *sc)
 	device_t dev;
 	int error;
 	uint8_t ctrl2;
-	bool xstp;
 
 	dev = sc->sc_dev;
 	/* 
-	 * The RX8025/RX8035 single register read is non-standard
+	 * The RX-8035 single register read is non-standard
 	 * Refer to section 8.9.5 of the RX-8035 application manual:
 	 * "I2C bus basic transfer format", under "Standard Read Method".
 	 * Basically, register to read goes into the top 4 bits.
 	 */
-	error = ds1307_read1(dev, (RX80X5_CTRL_2 << 4), &ctrl2);
+	error = ds1307_read1(dev, (RX8035_CTRL_2 << 4), &ctrl2);
 	if (error) {
 		device_printf(dev, "%s cannot read Control 2 register: %d\n",
 		    __func__, error);
 		return false;
 	}
-	xstp = (ctrl2 & RX80X5_CTRL_2_XSTP);
-	/*
-	 * XSTP is inverted on RX-8025:
-	 * (xstp == 1 -> OSC stop on RX-8035,
-	 *  xstp == 0 -> OSC stop on RX-8025)
-	 */
-	if (sc->chiptype == TYPE_EPSON_RX8025)
-		xstp = !xstp;
 
-	if (xstp) {
+	if (ctrl2 & RX8035_CTRL_2_XSTP) {
 		device_printf(dev, "Oscillation stop detected (ctrl2=%#02x)\n",
+		    ctrl2);
+		return false;
+	}
+	/* Power on reset (PON) generally implies oscillation stop,
+	 * but catch it as well to be sure
+	 */
+	if (ctrl2 & RX8035_CTRL_2_PON) {
+		device_printf(dev, "Power-on reset detected (ctrl2=%#02x)\n",
 		    ctrl2);
 		return false;
 	}
@@ -346,12 +340,11 @@ static bool is_dev_time_valid(struct ds1307_softc *sc)
 	uint8_t osc_en;
 	uint8_t secs;
 
-	/* Epsons are special. */
-	switch (sc->chiptype) {
-	case TYPE_EPSON_RX8025:
-	case TYPE_EPSON_RX8035:
+	/* Epson RTCs have different control/status
+	 * registers
+	 */
+	if (sc->chiptype == TYPE_EPSON_RX8035)
 		return is_epson_time_valid(sc);
-	}
 
 	dev = sc->sc_dev;
 	/* Check if the oscillator is disabled. */
@@ -398,7 +391,6 @@ ds1307_start(void *xdev)
 	 * Configuration parameters:
 	 * square wave output cannot be changed or inhibited on the RX-8035,
 	 * so don't present the sysctls there.
-	 * XXX-BZ 8025?
 	 */
 	if (sc->chiptype == TYPE_EPSON_RX8035)
 		goto skip_sysctl;
@@ -436,7 +428,7 @@ ds1307_gettime(device_t dev, struct timespec *ts)
 	struct bcd_clocktime bct;
 	struct ds1307_softc *sc;
 	int error;
-	uint8_t data[7], hourmask;
+	uint8_t data[7], hourmask, ampm_flag_bit;
 
 	sc = device_get_softc(dev);
 	error = iicdev_readfrom(sc->sc_dev, DS1307_SECS, data, sizeof(data),
@@ -452,15 +444,20 @@ ds1307_gettime(device_t dev, struct timespec *ts)
 		return (EINVAL);
 	}
 
+	if (sc->chiptype == TYPE_EPSON_RX8035)
+		ampm_flag_bit = RX8035_HOUR_USE_AMPM;
+	else
+		ampm_flag_bit = DS1307_HOUR_USE_AMPM;
+
 	/* If chip is in AM/PM mode remember that. */
-	if (data[DS1307_HOUR] & DS1307_HOUR_USE_AMPM) {
+	if (data[DS1307_HOUR] & ampm_flag_bit) {
 		sc->sc_use_ampm = true;
 		hourmask = DS1307_HOUR_MASK_12HR;
 	} else
 		hourmask = DS1307_HOUR_MASK_24HR;
 
 	bct.nsec = 0;
-	bct.ispm = (data[DS1307_HOUR] & DS1307_HOUR_IS_PM) != 0;
+	bct.ispm = (data[DS1307_HOUR] & ampm_flag_bit) != 0;
 	bct.sec  = data[DS1307_SECS]  & DS1307_SECS_MASK;
 	bct.min  = data[DS1307_MINS]  & DS1307_MINS_MASK;
 	bct.hour = data[DS1307_HOUR]  & hourmask;
@@ -493,7 +490,8 @@ ds1307_settime(device_t dev, struct timespec *ts)
 
 	/* If the chip is in AM/PM mode, adjust hour and set flags as needed. */
 	if (sc->sc_use_ampm) {
-		pmflags = DS1307_HOUR_USE_AMPM;
+		pmflags = (sc->chiptype != TYPE_EPSON_RX8035)
+				? DS1307_HOUR_USE_AMPM : RX8035_HOUR_USE_AMPM;
 		if (bct.ispm)
 			pmflags |= DS1307_HOUR_IS_PM;
 	} else

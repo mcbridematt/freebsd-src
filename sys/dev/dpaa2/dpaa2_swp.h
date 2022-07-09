@@ -1,7 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
- * Copyright (c) 2021-2022 Dmitry Salychev <dsl@mcusim.org>
+ * Copyright (c) 2021-2022 Dmitry Salychev
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -29,6 +29,9 @@
 #define	_DPAA2_SWP_H
 
 #include <sys/bus.h>
+
+#include "dpaa2_types.h"
+#include "dpaa2_bp.h"
 
 /*
  * DPAA2 QBMan software portal.
@@ -201,10 +204,6 @@ enum dpaa2_fd_format {
 	DPAA2_FD_SINGLE = 0,
 	DPAA2_FD_LIST,
 	DPAA2_FD_SG
-};
-
-struct dpaa2_atomic {
-	volatile int	counter;
 };
 
 /**
@@ -480,6 +479,8 @@ int dpaa2_swp_set_irq_coalescing(struct dpaa2_swp *swp, uint32_t threshold,
 /* Software portal commands. */
 int dpaa2_swp_conf_wq_channel(struct dpaa2_swp *swp, uint16_t chan_id,
     uint8_t we_mask, bool cdan_en, uint64_t ctx);
+int dpaa2_swp_query_bp(struct dpaa2_swp *swp, uint16_t bpid,
+    struct dpaa2_bp_conf *conf);
 int dpaa2_swp_release_bufs(struct dpaa2_swp *swp, uint16_t bpid, bus_addr_t *buf,
     uint32_t buf_num);
 int dpaa2_swp_dqrr_next_locked(struct dpaa2_swp *swp, struct dpaa2_dq *dq,

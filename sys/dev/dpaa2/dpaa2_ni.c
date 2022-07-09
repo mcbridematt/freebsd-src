@@ -1,7 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
- * Copyright (c) 2021-2022 Dmitry Salychev <dsl@mcusim.org>
+ * Copyright (c) 2021-2022 Dmitry Salychev
  * Copyright (c) 2022 Mathew McBride
  *
  * Redistribution and use in source and binary forms, with or without
@@ -83,6 +83,7 @@ __FBSDID("$FreeBSD$");
 #include "mdio_if.h"
 #include "memac_mdio_if.h"
 
+#include "dpaa2_types.h"
 #include "dpaa2_mc.h"
 #include "dpaa2_mc_if.h"
 #include "dpaa2_mcp.h"
@@ -110,9 +111,6 @@ __FBSDID("$FreeBSD$");
 
 #define DPAA2_TX_RING(sc, chan, tc)			\
 (&(sc)->channels[(chan)]->txc_queue.tx_rings[(tc)])
-
-/* Handy wrapper over an atomic operation. */
-#define ATOMIC_XCHG(a, val)	(atomic_swap_int(&(a)->counter, (val)))
 
 #define DPNI_IRQ_INDEX		0 /* Index of the only DPNI IRQ. */
 #define DPNI_IRQ_LINK_CHANGED	1 /* Link state changed */
@@ -164,7 +162,7 @@ __FBSDID("$FreeBSD$");
 #define DPAA2_NI_BUF_ADDR_MASK	(0x1FFFFFFFFFFFFul) /* 49-bit addresses max. */
 #define DPAA2_NI_BUF_CHAN_MASK	(0xFu)
 #define DPAA2_NI_BUF_CHAN_SHIFT	(60)
-#define DPAA2_NI_BUF_IDX_MASK	(0x7FFu)
+#define DPAA2_NI_BUF_IDX_MASK	(0x7FFFu)
 #define DPAA2_NI_BUF_IDX_SHIFT	(49)
 #define DPAA2_NI_TX_IDX_MASK	(0x7u)
 #define DPAA2_NI_TX_IDX_SHIFT	(57)
@@ -418,10 +416,8 @@ static int dpaa2_ni_set_hash(device_t, uint64_t);
 static int dpaa2_ni_set_dist_key(device_t, enum dpaa2_ni_dist_mode, uint64_t);
 
 /* Buffers and buffer pools */
-static int dpaa2_ni_seed_buf_pool(struct dpaa2_ni_softc *,
-    struct dpaa2_ni_channel *);
-static int dpaa2_ni_seed_buf(struct dpaa2_ni_softc *, struct dpaa2_ni_channel *,
-    struct dpaa2_ni_buf *, int);
+static int dpaa2_ni_seed_buf_pool(struct dpaa2_ni_softc *, uint32_t);
+static int dpaa2_ni_seed_buf(struct dpaa2_ni_softc *, struct dpaa2_ni_buf *, int);
 static int dpaa2_ni_seed_chan_storage(struct dpaa2_ni_softc *,
     struct dpaa2_ni_channel *);
 
@@ -467,6 +463,7 @@ static void dpaa2_ni_dmamap_cb(void *, bus_dma_segment_t *, int, int);
 /* Tx/Rx tasks. */
 static void dpaa2_ni_poll_task(void *, int);
 static void dpaa2_ni_tx_task(void *, int);
+static void dpaa2_ni_bp_task(void *, int);
 
 /* Tx/Rx subroutines */
 static int  dpaa2_ni_consume_frames(struct dpaa2_ni_channel *,
@@ -480,6 +477,8 @@ static int  dpaa2_ni_tx_conf(struct dpaa2_ni_channel *, struct dpaa2_ni_fq *,
 
 /* sysctl(9) */
 static int dpaa2_ni_collect_stats(SYSCTL_HANDLER_ARGS);
+static int dpaa2_ni_collect_buf_num(SYSCTL_HANDLER_ARGS);
+static int dpaa2_ni_collect_buf_free(SYSCTL_HANDLER_ARGS);
 
 static int
 dpaa2_ni_probe(device_t dev)
@@ -500,6 +499,7 @@ dpaa2_ni_attach(device_t dev)
 	struct dpaa2_devinfo *dinfo = device_get_ivars(dev);
 	struct dpaa2_devinfo *mcp_dinfo;
 	struct ifnet *ifp;
+	uint8_t	tq_name[32];
 	int error;
 
 	sc->dev = dev;
@@ -519,6 +519,9 @@ dpaa2_ni_attach(device_t dev)
 	sc->rx_ieoi_err_frames = 0;
 	sc->tx_single_buf_frames = 0;
 	sc->tx_sg_frames = 0;
+
+	DPAA2_ATOMIC_XCHG(&sc->buf_num, 0);
+	DPAA2_ATOMIC_XCHG(&sc->buf_free, 0);
 
 	sc->bp_dmat = NULL;
 	sc->st_dmat = NULL;
@@ -595,16 +598,34 @@ dpaa2_ni_attach(device_t dev)
 		goto err_close_rc;
 	}
 
-	/* Create a private taskqueue thread for handling driver events. */
-	sc->tq = taskqueue_create("dpaa2_ni_taskq", M_WAITOK,
-	    taskqueue_thread_enqueue, &sc->tq);
+	/* Create a taskqueue thread for handling driver events. */
+	bzero(tq_name, sizeof (tq_name));
+	snprintf(tq_name, sizeof (tq_name), "%s_tq",
+	    device_get_nameunit(dev));
+	sc->tq = taskqueue_create(tq_name, M_WAITOK, taskqueue_thread_enqueue,
+	    &sc->tq);
 	if (sc->tq == NULL) {
-		device_printf(dev, "%s: failed to allocate task queue\n",
-		    __func__);
+		device_printf(dev, "%s: failed to allocate task queue: %s\n",
+		    __func__, tq_name);
 		goto err_close_ni;
 	}
-	taskqueue_start_threads(&sc->tq, 1, PI_NET, "%s events",
+	taskqueue_start_threads(&sc->tq, 1, PI_NET, "%s", tq_name);
+
+	/* Create a taskqueue thread to release new buffers to the pool. */
+	bzero(tq_name, sizeof (tq_name));
+	snprintf(tq_name, sizeof (tq_name), "%s_tqbp",
 	    device_get_nameunit(dev));
+	sc->bp_taskq = taskqueue_create(tq_name, M_WAITOK,
+	    taskqueue_thread_enqueue, &sc->bp_taskq);
+	if (sc->bp_taskq == NULL) {
+		device_printf(dev, "%s: failed to allocate task queue: %s\n",
+		    __func__, tq_name);
+		goto err_close_ni;
+	}
+	taskqueue_start_threads(&sc->bp_taskq, 1, PI_NET, "%s", tq_name);
+
+	/* Task to release new buffers to the buffer pool. */
+	TASK_INIT(&sc->bp_task, 0, dpaa2_ni_bp_task, sc);
 
 	error = dpaa2_ni_setup(dev);
 	if (error) {
@@ -1040,7 +1061,6 @@ dpaa2_ni_setup_channels(device_t dev)
 		channel->ni_dev = dev;
 		channel->io_dev = io_dev;
 		channel->con_dev = con_dev;
-		channel->buf_num = 0;
 		channel->recycled_n = 0;
 
 		/* For debug purposes only! */
@@ -1085,7 +1105,7 @@ dpaa2_ni_setup_channels(device_t dev)
 		}
 
 		/* Allocate buffers and channel storage. */
-		error = dpaa2_ni_seed_buf_pool(sc, channel);
+		error = dpaa2_ni_seed_buf_pool(sc, DPAA2_NI_BUFS_INIT);
 		if (error) {
 			device_printf(dev, "%s: failed to seed buffer pool\n",
 			    __func__);
@@ -1361,6 +1381,7 @@ dpaa2_ni_setup_tx_flow(device_t dev, struct dpaa2_cmd *cmd,
 	struct dpaa2_ni_queue_cfg queue_cfg = {0};
 	struct dpaa2_ni_tx_ring *tx;
 	uint32_t tx_rings_n = 0;
+	uint8_t	tq_name[32];
 	int error;
 
 	/* Obtain DPCON associated with the FQ's channel. */
@@ -1439,16 +1460,19 @@ dpaa2_ni_setup_tx_flow(device_t dev, struct dpaa2_cmd *cmd,
 		/* Task to send mbufs from the Tx ring. */
 		TASK_INIT(&tx->task, 0, dpaa2_ni_tx_task, tx);
 
+		bzero(tq_name, sizeof (tq_name));
+		snprintf(tq_name, sizeof (tq_name), "%s_tqtx%d",
+		    device_get_nameunit(dev), tx->fqid);
+
 		/* Create a taskqueue for Tx ring to transmit mbufs. */
-		tx->taskq = taskqueue_create_fast("dpaa2_ni_tx_taskq",
-		    M_WAITOK, taskqueue_thread_enqueue, &tx->taskq);
+		tx->taskq = taskqueue_create_fast(tq_name, M_WAITOK,
+		    taskqueue_thread_enqueue, &tx->taskq);
 		if (tx->taskq == NULL) {
 			device_printf(dev, "%s: failed to allocate Tx ring "
-			    "taskqueue\n", __func__);
+			    "taskqueue: %s\n", __func__, tq_name);
 			return (ENOMEM);
 		}
-		taskqueue_start_threads(&tx->taskq, 1, PI_NET,
-		    "%s tx_taskq(fqid=%d)", device_get_nameunit(dev), tx->fqid);
+		taskqueue_start_threads(&tx->taskq, 1, PI_NET, "%s", tq_name);
 
 		tx_rings_n++;
 	}
@@ -1722,6 +1746,13 @@ dpaa2_ni_setup_sysctls(struct dpaa2_ni_softc *sc)
 	SYSCTL_ADD_UQUAD(ctx, parent, OID_AUTO, "tx_sg_frames",
 	    CTLFLAG_RD, &sc->tx_sg_frames,
 	    "Tx S/G frames");
+
+	SYSCTL_ADD_PROC(ctx, parent, OID_AUTO, "buf_num",
+	    CTLTYPE_U32 | CTLFLAG_RD, sc, 0, dpaa2_ni_collect_buf_num,
+	    "IU", "number of Rx buffers in the buffer pool");
+	SYSCTL_ADD_PROC(ctx, parent, OID_AUTO, "buf_free",
+	    CTLTYPE_U32 | CTLFLAG_RD, sc, 0, dpaa2_ni_collect_buf_free,
+	    "IU", "number of free Rx buffers in the buffer pool");
 
  	parent = SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev));
 
@@ -2556,6 +2587,39 @@ dpaa2_ni_dmamap_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
 }
 
 /**
+ * @brief Task to release new buffers to the buffer pool.
+ */
+static void
+dpaa2_ni_bp_task(void *arg, int count)
+{
+	device_t bp_dev;
+	struct dpaa2_ni_softc *sc = (struct dpaa2_ni_softc *) arg;
+	struct dpaa2_bp_softc *bpsc;
+	struct dpaa2_bp_conf bp_conf;
+	const int buf_num = DPAA2_ATOMIC_READ(&sc->buf_num);
+	int error;
+
+	/* There's only one buffer pool for now. */
+	bp_dev = (device_t) rman_get_start(sc->res[BP_RID(0)]);
+	bpsc = device_get_softc(bp_dev);
+
+	/* Get state of the buffer pool. */
+	error = DPAA2_SWP_QUERY_BP(sc->channels[0]->io_dev, bpsc->attr.bpid,
+	    &bp_conf);
+	if (error) {
+		device_printf(sc->dev, "%s: failed to query buffer pool "
+		    "configuration: error=%d\n", __func__, error);
+		return;
+	}
+
+	/* Double allocated buffers number if free buffers < 25%. */
+	if (bp_conf.free_bufn < (buf_num >> 2)) {
+		(void)dpaa2_ni_seed_buf_pool(sc, buf_num);
+		DPAA2_ATOMIC_XCHG(&sc->buf_free, bp_conf.free_bufn);
+	}
+}
+
+/**
  * @brief Task to poll frames from a specific channel when CDAN is received.
  */
 static void
@@ -2758,7 +2822,6 @@ dpaa2_ni_rx(struct dpaa2_ni_channel *chan, struct dpaa2_ni_fq *fq,
 {
 	struct dpaa2_ni_softc *sc = device_get_softc(chan->ni_dev);
 	struct dpaa2_bp_softc *bpsc;
-	struct dpaa2_ni_channel	*buf_chan;
 	struct dpaa2_ni_buf *buf;
 	struct ifnet *ifp = sc->ifp;
 	struct mbuf *m;
@@ -2766,17 +2829,15 @@ dpaa2_ni_rx(struct dpaa2_ni_channel *chan, struct dpaa2_ni_fq *fq,
 	bus_addr_t paddr = (bus_addr_t) fd->addr;
 	bus_addr_t released[DPAA2_SWP_BUFS_PER_CMD];
 	void *buf_data;
-	int chan_idx, buf_idx, buf_len;
+	int buf_idx, buf_len;
 	int error, released_n = 0;
 
 	/*
-	 * Get channel and buffer indexes from the ADDR_TOK (not used by QBMan)
-	 * bits of the physical address.
+	 * Get buffer index from the ADDR_TOK (not used by QBMan) bits of the
+	 * physical address.
 	 */
-	chan_idx = dpaa2_ni_fd_chan_idx(fd);
 	buf_idx = dpaa2_ni_fd_buf_idx(fd);
-	buf_chan = sc->channels[chan_idx];
-	buf = &buf_chan->buf[buf_idx];
+	buf = &sc->buf[buf_idx];
 
 	KASSERT(paddr == buf->paddr, ("%s: unexpected frame buffer: "
 	    "fd_addr(%#jx) != buf_paddr(%#jx)", __func__, paddr, buf->paddr));
@@ -2832,19 +2893,19 @@ dpaa2_ni_rx(struct dpaa2_ni_channel *chan, struct dpaa2_ni_fq *fq,
 
 	/* Re-seed and release recycled buffers back to the pool. */
 	if (chan->recycled_n == DPAA2_SWP_BUFS_PER_CMD) {
+		/* Release new buffers to the pool if needed. */
+		taskqueue_enqueue(sc->bp_taskq, &sc->bp_task);
+
 		for (int i = 0; i < chan->recycled_n; i++) {
 			paddr = chan->recycled[i];
 
 			/* Parse ADDR_TOK of the recycled buffer. */
-			chan_idx = (paddr >> DPAA2_NI_BUF_CHAN_SHIFT)
-			    & DPAA2_NI_BUF_CHAN_MASK;
 			buf_idx = (paddr >> DPAA2_NI_BUF_IDX_SHIFT)
 			    & DPAA2_NI_BUF_IDX_MASK;
-			buf_chan = sc->channels[chan_idx];
-			buf = &buf_chan->buf[buf_idx];
+			buf = &sc->buf[buf_idx];
 
 			/* Seed recycled buffer. */
-			error = dpaa2_ni_seed_buf(sc, buf_chan, buf, buf_idx);
+			error = dpaa2_ni_seed_buf(sc, buf, buf_idx);
 			KASSERT(error == 0, ("Failed to seed recycled buffer: "
 			    "error=%d", error));
 			if (__predict_false(error != 0)) {
@@ -2887,20 +2948,16 @@ dpaa2_ni_rx_err(struct dpaa2_ni_channel *chan, struct dpaa2_ni_fq *fq,
 	device_t bp_dev;
 	struct dpaa2_ni_softc *sc = device_get_softc(chan->ni_dev);
 	struct dpaa2_bp_softc *bpsc;
-	struct dpaa2_ni_channel	*buf_chan;
 	struct dpaa2_ni_buf *buf;
 	bus_addr_t paddr = (bus_addr_t) fd->addr;
-	int chan_idx, buf_idx;
-	int error;
+	int buf_idx, error;
 	
 	/*
-	 * Get channel and buffer indexes from the ADDR_TOK (not used by QBMan)
-	 * bits of the physical address.
+	 * Get buffer index from the ADDR_TOK (not used by QBMan) bits of the
+	 * physical address.
 	 */
-	chan_idx = dpaa2_ni_fd_chan_idx(fd);
 	buf_idx = dpaa2_ni_fd_buf_idx(fd);
-	buf_chan = sc->channels[chan_idx];
-	buf = &buf_chan->buf[buf_idx];
+	buf = &sc->buf[buf_idx];
 
 	KASSERT(paddr == buf->paddr, ("%s: unexpected frame buffer: "
 	    "fd_addr(%#jx) != buf_paddr(%#jx)", __func__, paddr, buf->paddr));
@@ -2990,70 +3047,68 @@ dpaa2_ni_cmp_api_version(struct dpaa2_ni_softc *sc, uint16_t major,
  * @brief Allocate buffers visible to QBMan and release them to the buffer pool.
  */
 static int
-dpaa2_ni_seed_buf_pool(struct dpaa2_ni_softc *sc, struct dpaa2_ni_channel *chan)
+dpaa2_ni_seed_buf_pool(struct dpaa2_ni_softc *sc, uint32_t seedn)
 {
 	device_t bp_dev;
 	struct dpaa2_bp_softc *bpsc;
 	struct dpaa2_ni_buf *buf;
 	bus_addr_t paddr[DPAA2_SWP_BUFS_PER_CMD];
-	int i, j, error, bufn, chan_bufn, buf_idx;
-	bool stop = false;
+	const int buf_alloc = DPAA2_ATOMIC_READ(&sc->buf_num);
+	int i, error, bufn = 0;
 
-	/* DMA tag for buffer pool must already be created. */
-	if (sc->bp_dmat == NULL)
-		return (ENXIO);
+	KASSERT(sc->bp_dmat != NULL, ("%s: DMA tag for buffer pool not "
+	    "created?", __func__));
 
 	/* There's only one buffer pool for now. */
 	bp_dev = (device_t) rman_get_start(sc->res[BP_RID(0)]);
 	bpsc = device_get_softc(bp_dev);
 
-	KASSERT(DPAA2_NI_BUFS_PER_CHAN <= DPAA2_NI_MAX_BPC,
-	    ("%s: too many buffers (%d) per channel: max=%d", __func__,
-	    DPAA2_NI_BUFS_PER_CHAN, DPAA2_NI_MAX_BPC));
+	/* Limit # of buffers released to the pool. */
+	if (buf_alloc + seedn > DPAA2_NI_BUFS_MAX)
+		seedn = DPAA2_NI_BUFS_MAX - buf_alloc;
 
-	chan_bufn = 0;
-
-	for (i = 0; i < DPAA2_NI_BUFS_PER_CHAN; i += DPAA2_SWP_BUFS_PER_CMD) {
-		bufn = 0;
-		/* Allocate enough buffers to release in one QBMan command. */
-		for (j = 0; j < DPAA2_SWP_BUFS_PER_CMD; j++) {
-			buf_idx = i + j;
-			if (buf_idx >= DPAA2_NI_BUFS_PER_CHAN) {
-				/* Release the last buffers to the pool. */
-				stop = true;
-				break;
-			}
-
-			buf = &chan->buf[buf_idx];
-			buf->dmap = NULL;
-			buf->m = NULL;
-			buf->paddr = 0;
-			buf->vaddr = NULL;
-
-			error = dpaa2_ni_seed_buf(sc, chan, buf, buf_idx);
+	/* Release "seedn" buffers to the pool. */
+	for (i = buf_alloc; i < (buf_alloc + seedn); i++) {
+		/* Enough buffers were allocated for a single command. */
+		if (bufn == DPAA2_SWP_BUFS_PER_CMD) {
+			error = DPAA2_SWP_RELEASE_BUFS(sc->channels[0]->io_dev,
+			    bpsc->attr.bpid, paddr, bufn);
 			if (error) {
-				/* Release some buffers to the pool at least. */
-				stop = true;
-				break;
+				device_printf(sc->dev, "%s: failed to release "
+				    "buffers to the pool (1)\n", __func__);
+				return (error);
 			}
-			paddr[bufn] = buf->paddr;
-			bufn++;
-			chan_bufn++;
+			DPAA2_ATOMIC_ADD(&sc->buf_num, bufn);
+			bufn = 0;
 		}
 
-		/* Release buffer back to the buffer pool. */
-		error = DPAA2_SWP_RELEASE_BUFS(chan->io_dev, bpsc->attr.bpid,
-		    paddr, bufn);
+		buf = &sc->buf[i];
+		buf->m = NULL;
+		buf->dmap = NULL;
+		buf->paddr = 0;
+		buf->vaddr = NULL;
+		buf->sgt_dmap = NULL;
+		buf->sgt_paddr = 0;
+		buf->sgt_vaddr = NULL;
+
+		error = dpaa2_ni_seed_buf(sc, buf, i);
+		if (error)
+			break;
+		paddr[bufn] = buf->paddr;
+		bufn++;
+	}
+
+	/* Release if there are buffers left. */
+	if (bufn > 0) {
+		error = DPAA2_SWP_RELEASE_BUFS(sc->channels[0]->io_dev,
+		    bpsc->attr.bpid, paddr, bufn);
 		if (error) {
-			device_printf(sc->dev, "%s: failed to release buffers "
-			    "to the buffer pool\n", __func__);
+			device_printf(sc->dev, "%s: failed to release "
+			    "buffers to the pool (2)\n", __func__);
 			return (error);
 		}
-
-		if (stop)
-			break; /* Stop seeding buffers after error. */
+		DPAA2_ATOMIC_ADD(&sc->buf_num, bufn);
 	}
-	chan->buf_num = chan_bufn;
 
 	return (0);
 }
@@ -3062,8 +3117,7 @@ dpaa2_ni_seed_buf_pool(struct dpaa2_ni_softc *sc, struct dpaa2_ni_channel *chan)
  * @brief Prepares a buffer to be released to the buffer pool.
  */
 static int
-dpaa2_ni_seed_buf(struct dpaa2_ni_softc *sc, struct dpaa2_ni_channel *chan,
-    struct dpaa2_ni_buf *buf, int buf_idx)
+dpaa2_ni_seed_buf(struct dpaa2_ni_softc *sc, struct dpaa2_ni_buf *buf, int idx)
 {
 	struct mbuf *m;
 	bus_dmamap_t dmap;
@@ -3076,7 +3130,7 @@ dpaa2_ni_seed_buf(struct dpaa2_ni_softc *sc, struct dpaa2_ni_channel *chan,
 		if (error) {
 			device_printf(sc->dev, "%s: failed to create DMA map "
 			    "for buffer: buf_idx=%d, error=%d\n", __func__,
-			    buf_idx, error);
+			    idx, error);
 			return (error);
 		}
 		buf->dmap = dmap;
@@ -3111,17 +3165,15 @@ dpaa2_ni_seed_buf(struct dpaa2_ni_softc *sc, struct dpaa2_ni_channel *chan,
 	buf->vaddr = m->m_data;
 
 	/*
-	 * Write channel and buffer indices to the ADDR_TOK (bits 63-49) which
-	 * is not used by QBMan and is supposed to assist in physical to virtual
-	 * address translation.
+	 * Write buffer index to the ADDR_TOK (bits 63-49) which is not used by
+	 * QBMan and is supposed to assist in physical to virtual address
+	 * translation.
 	 *
 	 * NOTE: "lowaddr" and "highaddr" of the window which cannot be accessed
 	 * 	 by QBMan must be configured in the DMA tag accordingly.
 	 */
 	buf->paddr =
-	    ((uint64_t)(chan->flowid & DPAA2_NI_BUF_CHAN_MASK) <<
-		DPAA2_NI_BUF_CHAN_SHIFT) |
-	    ((uint64_t)(buf_idx & DPAA2_NI_BUF_IDX_MASK) <<
+	    ((uint64_t)(idx & DPAA2_NI_BUF_IDX_MASK) <<
 		DPAA2_NI_BUF_IDX_SHIFT) |
 	    (buf->paddr & DPAA2_NI_BUF_ADDR_MASK);
 
@@ -3312,6 +3364,24 @@ dpaa2_ni_collect_stats(SYSCTL_HANDLER_ARGS)
 }
 
 static int
+dpaa2_ni_collect_buf_num(SYSCTL_HANDLER_ARGS)
+{
+	struct dpaa2_ni_softc *sc = (struct dpaa2_ni_softc *) arg1;
+	uint32_t buf_num = DPAA2_ATOMIC_READ(&sc->buf_num);
+
+	return (sysctl_handle_32(oidp, &buf_num, 0, req));
+}
+
+static int
+dpaa2_ni_collect_buf_free(SYSCTL_HANDLER_ARGS)
+{
+	struct dpaa2_ni_softc *sc = (struct dpaa2_ni_softc *) arg1;
+	uint32_t buf_free = DPAA2_ATOMIC_READ(&sc->buf_free);
+
+	return (sysctl_handle_32(oidp, &buf_free, 0, req));
+}
+
+static int
 dpaa2_ni_set_hash(device_t dev, uint64_t flags)
 {
 	struct dpaa2_ni_softc *sc = device_get_softc(dev);
@@ -3483,7 +3553,7 @@ dpaa2_ni_chan_storage_next(struct dpaa2_ni_channel *chan, struct dpaa2_dq **dq)
 		/* Reset token. */
 		msg->fdr.desc.tok = 0;
 		/* Make VDQ command available again. */
-		ATOMIC_XCHG(&swp->vdq.avail, 1);
+		DPAA2_ATOMIC_XCHG(&swp->vdq.avail, 1);
 	} else {
 		return (rc); /* DQ response is not available yet. */
 	}

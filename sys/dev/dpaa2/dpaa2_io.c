@@ -1,7 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
- * Copyright (c) 2021 Dmitry Salychev <dsl@mcusim.org>
+ * Copyright (c) 2021-2022 Dmitry Salychev
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -356,6 +356,17 @@ dpaa2_io_conf_wq_channel(device_t iodev, struct dpaa2_io_notif_ctx *ctx)
 }
 
 /**
+ * @brief Query current configuration/state of the buffer pool.
+ */
+static int
+dpaa2_io_query_bp(device_t iodev, uint16_t bpid, struct dpaa2_bp_conf *conf)
+{
+	struct dpaa2_io_softc *sc = device_get_softc(iodev);
+
+	return (dpaa2_swp_query_bp(sc->swp, bpid, conf));
+}
+
+/**
  * @brief Release one or more buffer pointers to the QBMan buffer pool.
  */
 static int
@@ -533,6 +544,7 @@ static device_method_t dpaa2_io_methods[] = {
 	/* QBMan software portal interface */
 	DEVMETHOD(dpaa2_swp_enq_multiple_fq,	dpaa2_io_enq_multiple_fq),
 	DEVMETHOD(dpaa2_swp_conf_wq_channel,	dpaa2_io_conf_wq_channel),
+	DEVMETHOD(dpaa2_swp_query_bp,		dpaa2_io_query_bp),
 	DEVMETHOD(dpaa2_swp_release_bufs,	dpaa2_io_release_bufs),
 
 	DEVMETHOD_END

@@ -1,7 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
- * Copyright (c) 2021 Dmitry Salychev <dsl@mcusim.org>
+ * Copyright (c) 2021-2022 Dmitry Salychev
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -28,6 +28,8 @@
 #ifndef	_DPAA2_TYPES_H
 #define	_DPAA2_TYPES_H
 
+#include <machine/atomic.h>
+
 enum dpaa2_dev_type {
 	DPAA2_DEV_MC = 7500,	/* Management Complex (firmware bus) */
 	DPAA2_DEV_RC,		/* Resource Container (firmware bus) */
@@ -42,6 +44,18 @@ enum dpaa2_dev_type {
 
 	DPAA2_DEV_NOTYPE	/* Shouldn't be assigned to any DPAA2 device. */
 };
+
+struct dpaa2_atomic {
+	volatile int counter;
+};
+
+/* Handy wrappers over atomic operations. */
+#define DPAA2_ATOMIC_XCHG(a, val) \
+	(atomic_swap_int(&(a)->counter, (val)))
+#define DPAA2_ATOMIC_READ(a) \
+	(atomic_load_acq_int(&(a)->counter))
+#define DPAA2_ATOMIC_ADD(a, val) \
+	(atomic_add_acq_int(&(a)->counter, (val)))
 
 /* Convert DPAA2 type to/from string. */
 const char		*dpaa2_ttos(enum dpaa2_dev_type type);

@@ -1,7 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
- * Copyright (c) 2022 Dmitry Salychev <dsl@mcusim.org>
+ * Copyright (c) 2022 Dmitry Salychev
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -43,6 +43,15 @@
 struct dpaa2_bp_attr {
 	uint32_t		 id;
 	uint16_t		 bpid;
+};
+
+/**
+ * @brief Configuration/state of the buffer pool.
+ */
+struct dpaa2_bp_conf {
+	uint8_t			 bdi;
+	uint8_t			 state; /* bitmask */
+	uint32_t		 free_bufn;
 };
 
 /**

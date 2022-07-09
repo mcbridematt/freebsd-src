@@ -28,6 +28,7 @@
 #include <machine/bus.h>
 #include <dev/dpaa2/dpaa2_mc.h>
 #include <dev/dpaa2/dpaa2_swp.h>
+#include <dev/dpaa2/dpaa2_bp.h>
 
 /**
  * @brief QBMan software portal interface.
@@ -80,3 +81,16 @@ METHOD int release_bufs {
 	bus_addr_t		*buf;
 	uint32_t		 buf_num;
 };
+
+/**
+ * @brief Query current configuration/state of the buffer pool.
+ *
+ * dev:		DPIO device.
+ * bpid:	Buffer pool ID.
+ * conf:	Configuration/state of the buffer pool.
+ */
+METHOD int query_bp {
+	device_t		 dev;
+	uint16_t		 bpid;
+	struct dpaa2_bp_conf	*conf;
+}

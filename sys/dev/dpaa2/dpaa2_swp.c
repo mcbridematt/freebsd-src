@@ -1,7 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
- * Copyright (c) 2021-2022 Dmitry Salychev <dsl@mcusim.org>
+ * Copyright (c) 2021-2022 Dmitry Salychev
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -54,6 +54,7 @@ __FBSDID("$FreeBSD$");
 
 #include "dpaa2_swp.h"
 #include "dpaa2_mc.h"
+#include "dpaa2_bp.h"
 
 #define CMD_SLEEP_TIMEOUT		1u	/* ms */
 #define CMD_SLEEP_ATTEMPTS		2000u	/* max. 2000 ms */
@@ -79,6 +80,7 @@ __FBSDID("$FreeBSD$");
 
 /* QBMan portal command codes. */
 #define CMDID_SWP_MC_ACQUIRE		0x30
+#define CMDID_SWP_BP_QUERY		0x32
 #define CMDID_SWP_WQCHAN_CONFIGURE	0x46
 
 /* QBMan portal command result codes. */
@@ -109,10 +111,6 @@ __FBSDID("$FreeBSD$");
 #define RAR_IDX(rar)			((rar) & 0x7u)
 #define RAR_VB(rar)			((rar) & 0x80u)
 #define RAR_SUCCESS(rar)		((rar) & 0x100u)
-
-/* Handy wrappers over atomic operations. */
-#define ATOMIC_XCHG(a, val)		(atomic_swap_int(&(a)->counter, (val)))
-#define ATOMIC_READ(a)			(atomic_load_acq_int(&(a)->counter))
 
 MALLOC_DEFINE(M_DPAA2_SWP, "dpaa2_swp", "DPAA2 QBMan Software Portal");
 
@@ -195,7 +193,7 @@ dpaa2_swp_init_portal(struct dpaa2_swp **swp, struct dpaa2_swp_desc *desc,
 	p->sdq |= DPAA2_SWP_SDQCR_TOKEN << QB_SDQCR_TOK_SHIFT;
 
 	/* Volatile Dequeue Command configuration. */
-	ATOMIC_XCHG(&p->vdq.avail, 1);
+	DPAA2_ATOMIC_XCHG(&p->vdq.avail, 1);
 	p->vdq.valid_bit = DPAA2_SWP_VALID_BIT;
 
 	/* Dequeue Response Ring configuration */
@@ -580,6 +578,55 @@ dpaa2_swp_conf_wq_channel(struct dpaa2_swp *swp, uint16_t chan_id,
 		    rsp.result);
 		return (EIO);
 	}
+
+	return (0);
+}
+
+/**
+ * @brief Query current configuration/state of the buffer pool.
+ */
+int
+dpaa2_swp_query_bp(struct dpaa2_swp *swp, uint16_t bpid,
+    struct dpaa2_bp_conf *conf)
+{
+	/* NOTE: 64 bytes command. */
+	struct __packed {
+		uint8_t		verb;
+		uint8_t		_reserved1;
+		uint16_t	bpid;
+		uint8_t		_reserved2[60];
+	} cmd = {0};
+	struct __packed {
+		uint8_t		verb;
+		uint8_t		result;
+		uint32_t	_reserved1;
+		uint8_t		bdi;
+		uint8_t		state;
+		uint32_t	fill;
+		/* TODO: Support the other fields as well. */
+		uint8_t		_reserved2[52];
+	} rsp;
+	int error;
+
+	if (swp == NULL || conf == NULL)
+		return (EINVAL);
+
+	cmd.bpid = bpid;
+
+	error = dpaa2_swp_exec_mgmt_command(swp, (struct dpaa2_swp_cmd *) &cmd,
+	    (struct dpaa2_swp_rsp *) &rsp, CMDID_SWP_BP_QUERY);
+	if (error)
+		return (error);
+
+	if (rsp.result != QBMAN_CMD_RC_OK) {
+		device_printf(swp->desc->dpio_dev, "BP query error: bpid=%d, "
+		    "result=0x%02x\n", bpid, rsp.result);
+		return (EIO);
+	}
+
+	conf->bdi = rsp.bdi;
+	conf->state = rsp.state;
+	conf->free_bufn = rsp.fill;
 
 	return (0);
 }
@@ -972,10 +1019,10 @@ dpaa2_swp_exec_vdc_command(struct dpaa2_swp *swp, struct dpaa2_swp_cmd *cmd)
 	if (!swp || !cmd)
 		return (EINVAL);
 
-	if (ATOMIC_READ(&swp->vdq.avail) == 0)
+	if (DPAA2_ATOMIC_READ(&swp->vdq.avail) == 0)
 		return (EBUSY);
 	else
-		ATOMIC_XCHG(&swp->vdq.avail, 0);
+		DPAA2_ATOMIC_XCHG(&swp->vdq.avail, 0);
 
 	dpaa2_swp_lock(swp, &flags);
 	if (flags & DPAA2_SWP_DESTROYED) {

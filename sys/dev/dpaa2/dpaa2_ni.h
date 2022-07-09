@@ -1,7 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
- * Copyright (c) 2021-2022 Dmitry Salychev <dsl@mcusim.org>
+ * Copyright (c) 2021-2022 Dmitry Salychev
  * Copyright (c) 2022 Mathew McBride
  *
  * Redistribution and use in source and binary forms, with or without
@@ -60,9 +60,9 @@
 #define DPAA2_NI_MAX_TCS	8  /* traffic classes per DPNI */
 #define DPAA2_NI_MAX_POOLS	8  /* buffer pools per DPNI */
 
-/* Maximum number of buffers allocated per channel. */
-#define DPAA2_NI_BUFS_PER_CHAN	(50u * DPAA2_SWP_BUFS_PER_CMD)
-#define DPAA2_NI_MAX_BPC	(2048u) /* 11 bits for buffer index max. */
+/* Maximum number of Rx buffers. */
+#define DPAA2_NI_BUFS_INIT	(50u * DPAA2_SWP_BUFS_PER_CMD)
+#define DPAA2_NI_BUFS_MAX	(32768u) /* 15 bits for buffer index max. */
 
 /* Maximum number of buffers allocated per Tx ring. */
 #define DPAA2_NI_BUFS_PER_TX	(128u)
@@ -305,10 +305,6 @@ struct dpaa2_ni_channel {
 
 	/* Context to configure CDAN. */
 	struct dpaa2_io_notif_ctx ctx;
-
-	/* Buffers for buffer pool. */
-	uint32_t		 buf_num;
-	struct dpaa2_ni_buf	 buf[DPAA2_NI_BUFS_PER_CHAN];
 
 	/* Channel storage (to keep responses from VDQ command). */
 	struct dpaa2_ni_sbuf	 store;
@@ -613,6 +609,11 @@ struct dpaa2_ni_softc {
 	struct dpaa2_ni_channel	*channels[DPAA2_NI_MAX_CHANNELS];
 	struct dpaa2_ni_fq	 rxe_queue; /* one per network interface */
 
+	/* Rx buffers for buffer pool. */
+	struct dpaa2_atomic	 buf_num;
+	struct dpaa2_atomic	 buf_free; /* for sysctl(9) only */
+	struct dpaa2_ni_buf	 buf[DPAA2_NI_BUFS_MAX];
+
 	/* Interrupts */
 	int			 irq_rid[DPAA2_NI_MSI_COUNT];
 	struct resource		*irq_res;
@@ -620,6 +621,8 @@ struct dpaa2_ni_softc {
 
 	/* Tasks */
 	struct taskqueue	*tq;
+	struct taskqueue	*bp_taskq;
+	struct task		 bp_task;
 
 	/* Callouts */
 	struct callout		 mii_callout;

@@ -340,6 +340,7 @@ qoriq_therm_attach(device_t dev)
 	/* start monitoring */
 	sites = (1U << sc->ntsensors) - 1;
 	if (sc->ver == 1) {
+		sites <<= (16 - sc->ntsensors);
 		WR4(sc, TMU_TMR, 0x8C000000 | sites);
 	} else {
 		WR4(sc, TMUV2_TMSR, sites);

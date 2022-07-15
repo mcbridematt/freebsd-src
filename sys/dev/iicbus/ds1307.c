@@ -350,8 +350,10 @@ mark_epson_time_valid(struct ds1307_softc *sc)
 		return false;
 	}
 
+	device_printf(dev, "Ctrl 2 before: %02X ", ctrl2);
 	control_mask = (RX8035_CTRL_2_PON | RX8035_CTRL_2_XSTP | RX8035_CTRL_2_VDET);
 	ctrl2 = ctrl2 & ~(control_mask);
+	device_printf(dev, "Ctrl 2 after: %02X\n", ctrl2);
 
 	error = ds1307_write1(dev, (RX8035_CTRL_2 << 4), ctrl2);
 	if (error) {
